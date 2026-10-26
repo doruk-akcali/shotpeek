@@ -117,7 +117,7 @@ static void StopAnimation(void) { InterlockedIncrement(&AnimGen); }
 static void Dismiss(void)
 {
 	KillTimer(Peek, TIMER_DISMISS);
-	Animate(PeekGone, 220, true);
+	Animate(PeekGone, 400, true);
 }
 
 static void HideNow(void)
@@ -157,7 +157,7 @@ static bool RenderPeek(const wchar_t *path)
 	GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
 	Scale = dpiX / 96.0f;
 
-	float fit = fminf(240 * Scale / iw, 160 * Scale / ih);
+	float fit = fminf(300 * Scale / iw, 200 * Scale / ih);
 	if (fit > 1) fit = 1;
 	int tw = (int)(iw * fit + 0.5f), th = (int)(ih * fit + 0.5f);
 	if (tw < 24 * Scale) tw = 24 * Scale;
@@ -217,7 +217,7 @@ static bool RenderPeek(const wchar_t *path)
 	int margin = 14 * Scale;
 	PeekW = W; PeekH = H;
 	PeekHome.x = mi.rcWork.right - W - margin + pad;
-	PeekHome.y = mi.rcWork.bottom - H - margin + pad;
+	PeekHome.y = mi.rcWork.bottom - H - 60 * Scale + pad; // Clear of the auto-hidden taskbar when it pops up
 	PeekGone = mi.rcMonitor.right + 2;
 
 	HDC memory = CreateCompatibleDC(screen);
@@ -241,8 +241,8 @@ static void ShowShot(const wchar_t *path)
 	if (!RenderPeek(path)) return;
 	wcsncpy(ShotPath, path, MAX_PATH - 1);
 	SetWindowPos(Peek, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-	Animate(PeekHome.x, 300, false);
-	SetTimer(Peek, TIMER_DISMISS, SHOW_MS, NULL);
+	KillTimer(Peek, TIMER_DISMISS);
+	Animate(PeekHome.x, 300, false); // The 6 s start once it has arrived (WM_ANIMDONE)
 }
 
 //================
@@ -395,7 +395,9 @@ static LRESULT CALLBACK PeekProcedure(HWND hwnd, UINT message, WPARAM wparam, LP
 			}
 			return 0;
 		case WM_ANIMDONE:
-			if ((LONG)wparam == AnimGen && lparam) ShowWindow(hwnd, SW_HIDE);
+			if ((LONG)wparam != AnimGen) return 0;
+			if (lparam) ShowWindow(hwnd, SW_HIDE);
+			else SetTimer(hwnd, TIMER_DISMISS, SHOW_MS, NULL); // Resting in the corner: full 6 s from now
 			return 0;
 		case WM_MOUSEACTIVATE:
 			return MA_NOACTIVATE; // Never take focus from the app being worked in
