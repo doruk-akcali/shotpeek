@@ -1,15 +1,18 @@
 // ShotPeek: macOS-style screenshot preview for Windows.
 //
-// F6 opens the Windows snip overlay (same as Win+Shift+S). Every new image in
-// the Screenshots folder (Snipping Tool saves there) slides in as a thumbnail
-// at the bottom-right of the screen for a few seconds:
+// F6 freezes the screen instantly (ShotPeek is already running, so there is no
+// app to start): drag a box to capture it, Esc or right-click cancels. The shot
+// is saved to the Screenshots folder and copied to the clipboard.
+// Every new image in the Screenshots folder (ShotPeek's own, and Win+Shift+S
+// snips from Snipping Tool) slides in as a thumbnail at the bottom-right of the
+// screen for a few seconds:
 //   drag it      -> drops the image file into any app (chat, mail, folder)
 //   click it     -> opens the image
 //   swipe right  -> dismisses it
 //   right-click  -> Open / Show in folder / Copy / Close / Quit
 //
 // Build (w64devkit):
-//   gcc -std=c99 -Os -mwindows -s -o shotpeek.exe src/shotpeek.c -lgdiplus -lole32 -luuid -lshell32 -lshcore -ldwmapi -lwinmm -lgdi32
+//   gcc -std=c99 -Os -municode -mwindows -s -o shotpeek.exe src/shotpeek.c -lgdiplus -lole32 -luuid -lshell32 -lshcore -ldwmapi -lwinmm -lgdi32
 
 #define COBJMACROS
 #include <windows.h>
@@ -42,7 +45,10 @@ int WINAPI GdipSetPixelOffsetMode(void *graphics, INT mode);
 int WINAPI GdipDrawImageRectI(void *graphics, void *image, INT x, INT y, INT width, INT height);
 int WINAPI GdipDeleteGraphics(void *graphics);
 int WINAPI GdipDisposeImage(void *image);
+int WINAPI GdipSaveImageToFile(void *image, const WCHAR *file, const CLSID *encoder, const void *params);
 #define PixelFormat32bppPARGB      0x000E200B
+#define PixelFormat32bppRGB        0x00022009
+static const CLSID PngEncoder = {0x557cf406, 0x1a04, 0x11d3, {0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e}};
 #define InterpolationHighQualityBicubic 7
 #define PixelOffsetHighQuality     2
 
@@ -361,6 +367,226 @@ static DWORD WINAPI WatchThread(LPVOID unused)
 }
 
 //================
+// Capture overlay: frozen, dimmed screen; drag a box; Esc cancels
+//================
+
+static HWND      Snip;                    // Overlay window (exists only while capturing)
+static int       SnipX, SnipY, SnipW, SnipH; // Virtual-screen rectangle it covers
+static uint32_t *SnipPixels;              // Frozen screen, top-down BGRA
+static HDC       SnipBright, SnipDim, SnipBack; // Memory DCs: original, darkened, back buffer
+static HBITMAP   SnipBrightBmp, SnipDimBmp, SnipBackBmp;
+static HGDIOBJ   SnipOld[3];
+static HFONT     SnipFont;
+static bool      Selecting;
+static POINT     SelFrom, SelTo;          // Client coordinates
+
+static RECT SelRect(void)
+{
+	RECT r = {min(SelFrom.x, SelTo.x), min(SelFrom.y, SelTo.y), max(SelFrom.x, SelTo.x) + 1, max(SelFrom.y, SelTo.y) + 1};
+	return r;
+}
+
+static HBITMAP MakeDib(HDC like, int w, int h, uint32_t **bits)
+{
+	BITMAPINFO bmi = {0};
+	bmi.bmiHeader.biSize = sizeof bmi.bmiHeader; bmi.bmiHeader.biWidth = w; bmi.bmiHeader.biHeight = -h;
+	bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BI_RGB;
+	return CreateDIBSection(like, &bmi, DIB_RGB_COLORS, (void **)bits, NULL, 0);
+}
+
+static void EndSnip(void)
+{
+	if (!Snip) return;
+	HWND window = Snip;
+	Snip = NULL;
+	Selecting = false;
+	ReleaseCapture();
+	DestroyWindow(window);
+	SelectObject(SnipBright, SnipOld[0]); SelectObject(SnipDim, SnipOld[1]); SelectObject(SnipBack, SnipOld[2]);
+	DeleteDC(SnipBright); DeleteDC(SnipDim); DeleteDC(SnipBack);
+	DeleteObject(SnipBrightBmp); DeleteObject(SnipDimBmp); DeleteObject(SnipBackBmp);
+	if (SnipFont) DeleteObject(SnipFont);
+	SnipFont = NULL;
+	SnipPixels = NULL; // Owned by SnipBrightBmp
+}
+
+static void CopyToClipboard(const uint32_t *top, int w, int h) // CF_DIB, bottom-up 32 bpp
+{
+	size_t bytes = sizeof(BITMAPINFOHEADER) + (size_t)w * h * 4;
+	HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+	if (!mem) return;
+	BITMAPINFOHEADER *hdr = GlobalLock(mem);
+	*hdr = (BITMAPINFOHEADER){sizeof *hdr, w, h, 1, 32, BI_RGB, (DWORD)(w * h * 4)};
+	uint32_t *dst = (uint32_t *)(hdr + 1);
+	for (int y = 0; y < h; y++) memcpy(dst + (size_t)(h - 1 - y) * w, top + (size_t)y * w, (size_t)w * 4);
+	GlobalUnlock(mem);
+	if (OpenClipboard(Peek)) {
+		EmptyClipboard();
+		if (!SetClipboardData(CF_DIB, mem)) GlobalFree(mem);
+		CloseClipboard();
+	} else {
+		GlobalFree(mem);
+	}
+}
+
+static void FinishSnip(void)
+{
+	RECT r = SelRect();
+	int w = r.right - r.left, h = r.bottom - r.top;
+	if (w < 4 || h < 4) { EndSnip(); return; } // A click, not a box: cancel
+	uint32_t *crop = malloc((size_t)w * h * 4);
+	if (crop) for (int y = 0; y < h; y++) memcpy(crop + (size_t)y * w, SnipPixels + (size_t)(r.top + y) * SnipW + r.left, (size_t)w * 4);
+	EndSnip(); // Overlay gone before the (slower) file write
+	if (!crop) return;
+
+	CopyToClipboard(crop, w, h);
+	SYSTEMTIME t; GetLocalTime(&t);
+	wchar_t path[MAX_PATH];
+	swprintf(path, MAX_PATH, L"%ls\\Screenshot %04d-%02d-%02d %02d%02d%02d.png", ShotDir, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+	for (int n = 2; GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES && n < 100; n++)
+		swprintf(path, MAX_PATH, L"%ls\\Screenshot %04d-%02d-%02d %02d%02d%02d (%d).png", ShotDir, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, n);
+	void *bitmap = NULL;
+	if (GdipCreateBitmapFromScan0(w, h, w * 4, PixelFormat32bppRGB, (BYTE *)crop, &bitmap) == 0 && bitmap) {
+		GdipSaveImageToFile(bitmap, path, &PngEncoder, NULL); // The folder watcher then shows the preview
+		GdipDisposeImage(bitmap);
+	}
+	free(crop);
+}
+
+static void PaintSnip(HDC target)
+{
+	BitBlt(SnipBack, 0, 0, SnipW, SnipH, SnipDim, 0, 0, SRCCOPY);
+	if (Selecting) {
+		RECT r = SelRect();
+		int w = r.right - r.left, h = r.bottom - r.top;
+		BitBlt(SnipBack, r.left, r.top, w, h, SnipBright, r.left, r.top, SRCCOPY);
+		HBRUSH white = GetStockObject(WHITE_BRUSH);
+		FrameRect(SnipBack, &r, white);
+
+		// Size label in a dark pill below the box (above it near the bottom edge)
+		wchar_t label[32];
+		int len = swprintf(label, 32, L"%d × %d", w, h);
+		HGDIOBJ oldFont = SelectObject(SnipBack, SnipFont);
+		SIZE ts; GetTextExtentPoint32W(SnipBack, label, len, &ts);
+		int padX = ts.cy / 2, padY = ts.cy / 5, gap = ts.cy / 2;
+		int lw = ts.cx + 2 * padX, lh = ts.cy + 2 * padY;
+		int lx = r.left, ly = r.bottom + gap;
+		if (ly + lh > SnipH) ly = r.top - gap - lh;
+		if (ly < 0) ly = r.top + gap;
+		if (lx + lw > SnipW) lx = SnipW - lw;
+		HBRUSH pill = CreateSolidBrush(RGB(32, 32, 32));
+		HGDIOBJ oldBrush = SelectObject(SnipBack, pill), oldPen = SelectObject(SnipBack, GetStockObject(NULL_PEN));
+		RoundRect(SnipBack, lx, ly, lx + lw + 1, ly + lh + 1, lh / 2, lh / 2);
+		SelectObject(SnipBack, oldBrush); SelectObject(SnipBack, oldPen);
+		DeleteObject(pill);
+		SetBkMode(SnipBack, TRANSPARENT);
+		SetTextColor(SnipBack, RGB(245, 245, 245));
+		TextOutW(SnipBack, lx + padX, ly + padY, label, len);
+		SelectObject(SnipBack, oldFont);
+	}
+	BitBlt(target, 0, 0, SnipW, SnipH, SnipBack, 0, 0, SRCCOPY);
+}
+
+static LRESULT CALLBACK SnipProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+	switch (message) {
+		case WM_ERASEBKGND:
+			return 1;
+		case WM_PAINT: {
+			PAINTSTRUCT ps;
+			HDC dc = BeginPaint(hwnd, &ps);
+			if (SnipBack) PaintSnip(dc);
+			EndPaint(hwnd, &ps);
+			return 0;
+		}
+		case WM_LBUTTONDOWN:
+			SetCapture(hwnd);
+			Selecting = true;
+			SelFrom = SelTo = (POINT){GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+			InvalidateRect(hwnd, NULL, FALSE);
+			return 0;
+		case WM_MOUSEMOVE:
+			if (Selecting) {
+				SelTo.x = max(0, min(SnipW - 1, GET_X_LPARAM(lparam)));
+				SelTo.y = max(0, min(SnipH - 1, GET_Y_LPARAM(lparam)));
+				InvalidateRect(hwnd, NULL, FALSE);
+			}
+			return 0;
+		case WM_LBUTTONUP:
+			if (Selecting) FinishSnip();
+			return 0;
+		case WM_RBUTTONDOWN:
+			EndSnip();
+			return 0;
+		case WM_KEYDOWN:
+			if (wparam == VK_ESCAPE) EndSnip();
+			return 0;
+		case WM_ACTIVATE:
+			if (LOWORD(wparam) == WA_INACTIVE && !Selecting) EndSnip(); // Switched away (Alt+Tab, Win key)
+			return 0;
+		case WM_DPICHANGED:
+			return 0; // Keep covering the whole virtual screen as created
+	}
+	return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static void StartSnip(void)
+{
+	if (Snip) return;
+	HideNow(); // Keep an old preview out of the shot
+	SnipX = GetSystemMetrics(SM_XVIRTUALSCREEN); SnipY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+	SnipW = GetSystemMetrics(SM_CXVIRTUALSCREEN); SnipH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+	HDC screen = GetDC(NULL);
+	uint32_t *dim = NULL, *back = NULL;
+	SnipBrightBmp = MakeDib(screen, SnipW, SnipH, &SnipPixels);
+	SnipDimBmp = MakeDib(screen, SnipW, SnipH, &dim);
+	SnipBackBmp = MakeDib(screen, SnipW, SnipH, &back);
+	SnipBright = CreateCompatibleDC(screen); SnipDim = CreateCompatibleDC(screen); SnipBack = CreateCompatibleDC(screen);
+	if (!SnipBrightBmp || !SnipDimBmp || !SnipBackBmp) {
+		if (SnipBrightBmp) DeleteObject(SnipBrightBmp);
+		if (SnipDimBmp) DeleteObject(SnipDimBmp);
+		if (SnipBackBmp) DeleteObject(SnipBackBmp);
+		DeleteDC(SnipBright); DeleteDC(SnipDim); DeleteDC(SnipBack);
+		ReleaseDC(NULL, screen);
+		return;
+	}
+	SnipOld[0] = SelectObject(SnipBright, SnipBrightBmp);
+	SnipOld[1] = SelectObject(SnipDim, SnipDimBmp);
+	SnipOld[2] = SelectObject(SnipBack, SnipBackBmp);
+	BitBlt(SnipBright, 0, 0, SnipW, SnipH, screen, SnipX, SnipY, SRCCOPY | CAPTUREBLT);
+	ReleaseDC(NULL, screen);
+	GdiFlush();
+	size_t count = (size_t)SnipW * SnipH;
+	for (size_t i = 0; i < count; i++) {
+		uint32_t p = SnipPixels[i] | 0xFF000000; // Opaque, for the PNG and clipboard
+		SnipPixels[i] = p;
+		dim[i] = 0xFF000000 | ((p >> 16 & 0xFF) * 140 / 255) << 16 | ((p >> 8 & 0xFF) * 140 / 255) << 8 | (p & 0xFF) * 140 / 255;
+	}
+
+	POINT mouse; GetCursorPos(&mouse);
+	HMONITOR monitor = MonitorFromPoint(mouse, MONITOR_DEFAULTTOPRIMARY);
+	UINT dpiX = 96, dpiY = 96;
+	GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+	SnipFont = CreateFontW(-(int)(13 * dpiX / 96), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI Variable Text");
+
+	Selecting = false;
+	Snip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"ShotPeekSnip", L"ShotPeek capture", WS_POPUP,
+	                       SnipX, SnipY, SnipW, SnipH, NULL, NULL, GetModuleHandleW(NULL), NULL);
+	if (!Snip) { // Free the buffers EndSnip would have freed
+		SelectObject(SnipBright, SnipOld[0]); SelectObject(SnipDim, SnipOld[1]); SelectObject(SnipBack, SnipOld[2]);
+		DeleteDC(SnipBright); DeleteDC(SnipDim); DeleteDC(SnipBack);
+		DeleteObject(SnipBrightBmp); DeleteObject(SnipDimBmp); DeleteObject(SnipBackBmp);
+		DeleteObject(SnipFont); SnipFont = NULL;
+		return;
+	}
+	ShowWindow(Snip, SW_SHOW);
+	SetForegroundWindow(Snip);
+	SetFocus(Snip);
+	UpdateWindow(Snip);
+}
+
+//================
 // Window
 //================
 
@@ -368,7 +594,7 @@ static LRESULT CALLBACK PeekProcedure(HWND hwnd, UINT message, WPARAM wparam, LP
 {
 	switch (message) {
 		case WM_HOTKEY:
-			if (wparam == HOTKEY_F6) ShellExecuteW(NULL, L"open", L"ms-screenclip:", NULL, NULL, SW_SHOWNORMAL);
+			if (wparam == HOTKEY_F6) StartSnip();
 			return 0;
 		case WM_NEWSHOT: {
 			wchar_t *path = (wchar_t *)lparam;
@@ -492,6 +718,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
 	Peek = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, L"ShotPeek", L"ShotPeek",
 	                       WS_POPUP, 0, 0, 0, 0, NULL, NULL, instance, NULL);
 	if (!Peek) return 1;
+
+	WNDCLASSEXW snip = {0};
+	snip.cbSize = sizeof snip;
+	snip.lpfnWndProc = SnipProcedure;
+	snip.hInstance = instance;
+	snip.hCursor = LoadCursorW(NULL, IDC_CROSS);
+	snip.lpszClassName = L"ShotPeekSnip";
+	RegisterClassExW(&snip);
 
 	if (!RegisterHotKey(Peek, HOTKEY_F6, MOD_NOREPEAT, VK_F6) && !(args && wcsstr(args, L"--autorun"))) {
 		MessageBoxW(NULL, L"F6 is already taken by another app, so ShotPeek can't use it.\nScreenshots taken with Win+Shift+S still show the preview.", L"ShotPeek", MB_ICONWARNING);
