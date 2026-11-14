@@ -561,7 +561,7 @@ static void StartSnip(void)
 	for (size_t i = 0; i < count; i++) {
 		uint32_t p = SnipPixels[i] | 0xFF000000; // Opaque, for the PNG and clipboard
 		SnipPixels[i] = p;
-		dim[i] = 0xFF000000 | ((p >> 16 & 0xFF) * 140 / 255) << 16 | ((p >> 8 & 0xFF) * 140 / 255) << 8 | (p & 0xFF) * 140 / 255;
+		dim[i] = 0xFF000000 | ((p >> 16 & 0xFF) * 175 / 255) << 16 | ((p >> 8 & 0xFF) * 175 / 255) << 8 | (p & 0xFF) * 175 / 255;
 	}
 
 	POINT mouse; GetCursorPos(&mouse);
