@@ -77,12 +77,24 @@ static bool          Hovering, Pressed, Swiping;
 static POINT         PressAt;
 static volatile LONG AnimGen;
 
+static HDC           PeekDC;         // The thumbnail bitmap, kept for clipped redraws
+static HBITMAP       PeekBmp;
+static HGDIOBJ       PeekOldBmp;
+static int           PeekEdge;       // Right edge of the thumbnail's monitor
+
+// Moves the thumbnail, cut off at its monitor's right edge so it never shows on the screen next
+// to it while sliding in, out or being swiped (Doruk, 2026-11-24)
 static void Place(int x)
 {
 	PeekX = x;
-	POINT pos = {x, PeekHome.y};
+	if (!PeekDC) return;
+	int w = PeekEdge - x;
+	if (w > PeekW) w = PeekW;
+	POINT pos = {x, PeekHome.y}, src = {0, 0};
+	if (w <= 0) { pos.x = PeekEdge - 1; src.x = PeekW - 1; w = 1; } // Off the edge: only the transparent rim column remains
+	SIZE size = {w, PeekH};
 	BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-	UpdateLayeredWindow(Peek, NULL, &pos, NULL, NULL, NULL, 0, &blend, ULW_ALPHA); // Moves without re-sending the bitmap
+	UpdateLayeredWindow(Peek, NULL, &pos, &size, PeekDC, &src, 0, &blend, ULW_ALPHA);
 }
 
 //================
@@ -226,18 +238,14 @@ static bool RenderPeek(const wchar_t *path)
 	PeekHome.y = mi.rcWork.bottom - H - 60 * Scale + pad; // Clear of the auto-hidden taskbar when it pops up
 	PeekGone = mi.rcMonitor.right + 2;
 
-	HDC memory = CreateCompatibleDC(screen);
-	HGDIOBJ old = SelectObject(memory, bitmap);
-	POINT pos = {Pressed || Swiping ? PeekX : PeekGone, PeekHome.y}, zero = {0, 0};
-	SIZE size = {W, H};
-	BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
 	StopAnimation();
-	UpdateLayeredWindow(Peek, screen, &pos, &size, memory, &zero, 0, &blend, ULW_ALPHA);
-	PeekX = pos.x;
-	SelectObject(memory, old);
-	DeleteDC(memory);
-	DeleteObject(bitmap);
+	if (PeekDC) { SelectObject(PeekDC, PeekOldBmp); DeleteDC(PeekDC); DeleteObject(PeekBmp); }
+	PeekDC = CreateCompatibleDC(screen);
+	PeekBmp = bitmap;
+	PeekOldBmp = SelectObject(PeekDC, bitmap);
+	PeekEdge = mi.rcMonitor.right;
 	ReleaseDC(NULL, screen);
+	Place(Pressed || Swiping ? PeekX : PeekGone);
 	return true;
 }
 
@@ -648,7 +656,21 @@ static LRESULT CALLBACK PeekProcedure(HWND hwnd, UINT message, WPARAM wparam, LP
 					return 0;
 				}
 			}
-			if (Swiping) Place(PeekHome.x + (dx > 0 ? dx : 0));
+			if (Swiping) {
+				// Well into the next screen, a rightward drag is heading for the other monitor: drag the
+				// file there instead of dismissing (Doruk, 2026-11-24). A short flick still dismisses.
+				MONITORINFO mi = {.cbSize = sizeof mi};
+				HMONITOR home = MonitorFromPoint(PeekHome, MONITOR_DEFAULTTONEAREST);
+				HMONITOR under = MonitorFromPoint(now, MONITOR_DEFAULTTONULL);
+				GetMonitorInfoW(home, &mi);
+				if (under && under != home && now.x - mi.rcMonitor.right > 60 * Scale) {
+					Swiping = Pressed = false;
+					ReleaseCapture();
+					DragShot(); // Puts the thumbnail back home if the drop is cancelled
+					return 0;
+				}
+				Place(PeekHome.x + (dx > 0 ? dx : 0));
+			}
 			return 0;
 		}
 		case WM_MOUSELEAVE:
